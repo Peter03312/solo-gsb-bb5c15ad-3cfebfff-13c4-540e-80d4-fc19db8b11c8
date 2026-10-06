@@ -135,6 +135,55 @@ class BatchLogsRequest(StrictModel):
 
 
 # --------------------------------------------------------------------------
+# 日志归错演练：跨演练迁移（复核员一次把记录从源演练移至目标演练）
+# --------------------------------------------------------------------------
+class TransferLogsRequest(StrictModel):
+    """跨演练迁移请求体：目标演练号与非空、无重复的记录号列表。"""
+
+    target_drill_id: str = Field(..., description="目标演练号（须已存在且未封存）")
+    record_nos: list[str] = Field(
+        ...,
+        min_length=1,
+        description="待迁移的源演练记录号列表（非空、不可重复）",
+    )
+
+    @field_validator("target_drill_id")
+    @classmethod
+    def _target_drill_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("目标演练号不能为空")
+        if not _DRILL_ID_RE.match(v):
+            raise ValueError("演练号只能包含字母、数字、下划线、连字符与点")
+        return v
+
+    @field_validator("record_nos")
+    @classmethod
+    def _record_nos(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for v in values:
+            if not isinstance(v, str):
+                raise ValueError("记录号必须是字符串")
+            no = v.strip()
+            if not no:
+                raise ValueError("记录号不能为空")
+            cleaned.append(no)
+        return cleaned
+
+
+class TransferLogsResponse(StrictModel):
+    """跨演练迁移结果：两端版本各推进一次，并回传迁移记录与两端互证结果。"""
+
+    source_drill_id: str
+    target_drill_id: str
+    moved_record_nos: list[str]
+    source_version: int
+    target_version: int
+    source_result: ResultResponse
+    target_result: ResultResponse
+
+
+# --------------------------------------------------------------------------
 # 批量写入预演（复核员提交前预演）与确认
 # --------------------------------------------------------------------------
 class NormalizedLogItem(StrictModel):

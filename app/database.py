@@ -201,6 +201,41 @@ class PreviewBaseVersionChangedError(ServiceError):
     error_code = "preview_base_version_changed"
 
 
+class SameDrillTransferError(ServiceError):
+    """迁移的源演练与目标演练相同。"""
+
+    status_code = 422
+    error_code = "same_drill_transfer"
+
+
+class DuplicateRecordInTransferError(ServiceError):
+    """迁移请求的记录号列表内出现重复。"""
+
+    status_code = 409
+    error_code = "duplicate_record_in_transfer"
+
+
+class TransferRecordMissingError(ServiceError):
+    """待迁移记录在源演练中不存在。"""
+
+    status_code = 404
+    error_code = "transfer_record_missing"
+
+
+class TargetRecordExistsError(ServiceError):
+    """目标演练已存在同号记录，迁移会覆盖目标日志。"""
+
+    status_code = 409
+    error_code = "target_record_exists"
+
+
+class TransferRecordLockedError(ServiceError):
+    """待迁移记录参与了源演练的人工锁定，不能迁移。"""
+
+    status_code = 409
+    error_code = "transfer_record_locked"
+
+
 # --------------------------------------------------------------------------
 # 连接管理
 # --------------------------------------------------------------------------
@@ -955,6 +990,131 @@ def seal_drill(drill_id: str) -> dict:
                 (_now_iso(), drill_id),
             )
         return get_drill(drill_id)
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# 日志归错演练：跨演练迁移（复核员把记录从源演练移至目标演练）
+#
+# 单次写事务（BEGIN IMMEDIATE）内完成全部校验与改动：
+#   * 两演练均存在且未封存、源/目标不同；
+#   * 记录号列表非空、无重复；源记录全部存在；目标无同号记录；
+#   * 被移记录不参与源演练的任何人工锁定（未迁移的锁定照常生效）。
+# 任一条件不满足整次拒绝、回滚，两端状态不变。成功时日志原字段（含
+# 规范化后的呼号/波段/模式、UTC 时间与 updated_at）原样转存，两端各
+# 重算一次并各只推进一次版本，同事务留存各自的新版本快照；重算时源
+# 沿用源允许时差、目标沿用目标允许时差。双方日志、版本、结果与快照
+# 在同一事务原子提交。
+# --------------------------------------------------------------------------
+def transfer_logs(
+    source_drill_id: str,
+    target_drill_id: str,
+    record_nos: Iterable[str],
+) -> dict:
+    """把源演练中的指定记录原子迁移到目标演练。"""
+    record_nos = list(record_nos)
+    # 无重复：保留请求顺序用于回显（服务层已保证非空）。
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for no in record_nos:
+        if no in seen:
+            raise DuplicateRecordInTransferError(f"迁移记录号重复: {no}")
+        seen.add(no)
+        ordered.append(no)
+
+    conn = connect()
+    try:
+        with _write_tx(conn):
+            source = _get_drill_row(conn, source_drill_id)
+            # 目标未知同样报 drill_not_found（先确认两端演练都存在）。
+            target = _get_drill_row(conn, target_drill_id)
+            if source_drill_id == target_drill_id:
+                raise SameDrillTransferError(
+                    "源演练与目标演练不能相同，无需迁移"
+                )
+            _require_unsealed(source)
+            _require_unsealed(target)
+
+            placeholders = ",".join("?" for _ in ordered)
+            rows = conn.execute(
+                f"SELECT * FROM logs WHERE drill_id = ? AND record_no IN "
+                f"({placeholders})",
+                (source_drill_id, *ordered),
+            ).fetchall()
+            found = {r["record_no"] for r in rows}
+            missing = [no for no in ordered if no not in found]
+            if missing:
+                raise TransferRecordMissingError(
+                    f"源演练 {source_drill_id} 中记录不存在: "
+                    + ", ".join(missing)
+                )
+
+            target_rows = conn.execute(
+                f"SELECT record_no FROM logs WHERE drill_id = ? AND record_no IN "
+                f"({placeholders})",
+                (target_drill_id, *ordered),
+            ).fetchall()
+            if target_rows:
+                clash = sorted(r["record_no"] for r in target_rows)
+                raise TargetRecordExistsError(
+                    f"目标演练 {target_drill_id} 已存在同号记录: "
+                    + ", ".join(clash)
+                )
+
+            # 被移记录不得参与源演练的任何人工锁定（未涉及的锁定照常生效）。
+            lock_params = tuple(v for no in ordered for v in (no, no))
+            locked_rows = conn.execute(
+                "SELECT record_a, record_b FROM locks WHERE drill_id = ? "
+                "AND ("
+                + " OR ".join(
+                    ["record_a = ? OR record_b = ?"] * len(ordered)
+                )
+                + ")",
+                (source_drill_id, *lock_params),
+            ).fetchall()
+            if locked_rows:
+                pair = locked_rows[0]
+                raise TransferRecordLockedError(
+                    f"记录参与了源演练的人工锁定 "
+                    f"({pair['record_a']}, {pair['record_b']})，"
+                    "请先解除锁定再迁移"
+                )
+
+            # 原字段原样转存（station/counterpart/band/mode/时间均保留入库时
+            # 的规范化结果；updated_at 不刷新，保留日志原字段）。
+            by_no = {r["record_no"]: r for r in rows}
+            for no in ordered:
+                r = by_no[no]
+                conn.execute(
+                    "INSERT INTO logs (drill_id, record_no, station, "
+                    "counterpart, ts_micros, ts_iso, band, mode, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        target_drill_id, no, r["station"], r["counterpart"],
+                        r["ts_micros"], r["ts_iso"], r["band"], r["mode"],
+                        r["updated_at"],
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM logs WHERE drill_id = ? AND record_no = ?",
+                    (source_drill_id, no),
+                )
+
+            # 两端各只重算一次：各自版本 +1、结果与新版本快照同事务留存。
+            _recompute(conn, source_drill_id)
+            _recompute(conn, target_drill_id)
+
+            payload = {
+                "source_drill_id": source_drill_id,
+                "target_drill_id": target_drill_id,
+                "moved_record_nos": ordered,
+                "source_result": _result_from_conn(conn, source_drill_id),
+                "target_result": _result_from_conn(conn, target_drill_id),
+            }
+            payload["source_version"] = payload["source_result"]["version"]
+            payload["target_version"] = payload["target_result"]["version"]
+            return payload
     finally:
         conn.close()
 

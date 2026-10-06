@@ -25,6 +25,8 @@ from .schemas import (
     SnapshotListResponse,
     SnapshotResponse,
     StationSummaryResponse,
+    TransferLogsRequest,
+    TransferLogsResponse,
 )
 
 
@@ -37,7 +39,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="应急无线电演练通联日志互证服务",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "记录各台站通联日志，按相互指认、波段/模式一致、时差不超限的"
         "规则完成全场最优配对（最大配对数 → 最小总时差 → 字典序最小），"
@@ -170,6 +172,19 @@ def confirm_batch_logs(
 )
 def list_logs(drill_id: str) -> list[dict]:
     return database.list_logs(drill_id)
+
+
+@app.post(
+    "/drills/{drill_id}/transfer",
+    response_model=TransferLogsResponse,
+    tags=["logs"],
+    status_code=200,
+    summary="日志归错演练：把记录原子迁移到另一未封存演练（两端各推进一次版本）",
+)
+def transfer_logs(drill_id: str, payload: TransferLogsRequest) -> dict:
+    return database.transfer_logs(
+        drill_id, payload.target_drill_id, payload.record_nos
+    )
 
 
 # --------------------------------------------------------------------------

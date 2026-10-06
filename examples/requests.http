@@ -183,10 +183,49 @@ Content-Type: application/json
   "record_b": "R2"
 }
 
-### 版本快照：列出已留存版本号（创建即有 0；升级前旧版本不出现）
-GET {{host}}/drills/{{drill}}/snapshots
+### 日志归错演练：跨演练迁移（源演练路径参数；目标演练与记录号在请求体）
+### 受理条件：两演练均存在且未封存、源≠目标、源记录全存在、
+###           目标无同号记录、被移记录不参与源演练锁定；
+###           否则整次拒绝、两端状态不变。
+### 成功：日志原字段保留，按目标允许时差重算；两端各只推进一次版本、
+###       各留存一版新快照，日志/版本/结果/快照同一事务原子提交。
 
-### 取回指定版本快照（配对/未配对/总时差/锁定清单；未留存版本 404 snapshot_not_found）
+### 先建第二个演练作为迁移目标（允许时差 30 秒）
+POST {{host}}/drills
+Content-Type: application/json
+
+{
+  "drill_id": "DRILL-2026-B",
+  "allowed_time_diff_seconds": 30
+}
+
+### 把 R1、R2 从 DRILL-2026（允许 10 秒）迁到 DRILL-2026-B（允许 30 秒）
+### 例如两条记录时差 20 秒：源端配不上，迁入目标端后即可互证。
+POST {{host}}/drills/DRILL-2026/transfer
+Content-Type: application/json
+
+{
+  "target_drill_id": "DRILL-2026-B",
+  "record_nos": ["R1", "R2"]
+}
+
+### 拒绝示例：记录号列表为空（422）/ 列表内重复（409 duplicate_record_in_transfer）
+###   源记录不存在（404 transfer_record_missing）
+###   目标已有同号（409 target_record_exists）
+###   记录被源演练锁定占用（409 transfer_record_locked）
+###   源/目标相同（422 same_drill_transfer）
+###   任一端已封存（409 drill_sealed）
+### 以上任一拒绝均不改两端状态（日志、版本、结果、快照、锁定均不变）。
+POST {{host}}/drills/DRILL-2026/transfer
+Content-Type: application/json
+
+{
+  "target_drill_id": "DRILL-2026-B",
+  "record_nos": ["R1", "R1"]
+}
+
+### 版本快照：列出已留存版本号（创建即有 0；升级前旧版本不出现）
+GET {{host}}/drills/{{drill}}/snapshots### 取回指定版本快照（配对/未配对/总时差/锁定清单；未留存版本 404 snapshot_not_found）
 GET {{host}}/drills/{{drill}}/snapshots/0
 
 ### 比较两个已留存版本：配对/未配对/锁定的新增移除 + 同一对时差变化单列
