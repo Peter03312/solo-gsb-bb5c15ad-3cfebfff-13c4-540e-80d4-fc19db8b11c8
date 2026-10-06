@@ -20,6 +20,8 @@ from .schemas import (
     LockListResponse,
     LockRequest,
     LogEntry,
+    LogMigrationRequest,
+    LogMigrationResponse,
     ResultResponse,
     SnapshotDiffResponse,
     SnapshotListResponse,
@@ -37,11 +39,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="应急无线电演练通联日志互证服务",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "记录各台站通联日志，按相互指认、波段/模式一致、时差不超限的"
         "规则完成全场最优配对（最大配对数 → 最小总时差 → 字典序最小），"
-        "支持版本化更正、并发原子写入、演练封存与按台站汇总配对覆盖率。"
+        "支持版本化更正、并发原子写入、演练封存、日志跨演练迁移与"
+        "按台站汇总配对覆盖率。"
     ),
     lifespan=lifespan,
 )
@@ -170,6 +173,22 @@ def confirm_batch_logs(
 )
 def list_logs(drill_id: str) -> list[dict]:
     return database.list_logs(drill_id)
+
+
+@app.post(
+    "/drills/{drill_id}/logs/migrate",
+    response_model=LogMigrationResponse,
+    tags=["logs"],
+    status_code=200,
+    summary=(
+        "把源演练的一组日志一次原子迁移到目标演练"
+        "（两端各推进一次版本并重算留存快照）"
+    ),
+)
+def migrate_logs(drill_id: str, payload: LogMigrationRequest) -> dict:
+    return database.migrate_logs(
+        drill_id, payload.target_drill_id, payload.record_nos
+    )
 
 
 # --------------------------------------------------------------------------

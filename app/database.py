@@ -202,6 +202,37 @@ class PreviewBaseVersionChangedError(ServiceError):
 
 
 # --------------------------------------------------------------------------
+# 日志跨演练迁移（复核员发现日志归错演练，一次移到目标演练）
+# --------------------------------------------------------------------------
+class MigrationSameDrillError(ServiceError):
+    """源演练与目标演练相同（迁移无意义）。"""
+
+    status_code = 422
+    error_code = "migration_same_drill"
+
+
+class MigrationRecordMissingError(ServiceError):
+    """待迁移记录在源演练中不存在（整次拒绝、两端状态不变）。"""
+
+    status_code = 404
+    error_code = "migration_record_missing"
+
+
+class MigrationTargetExistsError(ServiceError):
+    """目标演练已存在同号记录（整次拒绝、两端状态不变）。"""
+
+    status_code = 409
+    error_code = "migration_target_record_exists"
+
+
+class MigrationRecordLockedError(ServiceError):
+    """待迁移记录参与了源演练的人工锁定（整次拒绝、两端状态不变）。"""
+
+    status_code = 409
+    error_code = "migration_record_locked"
+
+
+# --------------------------------------------------------------------------
 # 连接管理
 # --------------------------------------------------------------------------
 def connect() -> sqlite3.Connection:
@@ -685,6 +716,15 @@ def _check_batch_unique(items: list[dict]) -> None:
         seen.add(it["record_no"])
 
 
+def _check_record_no_unique(record_nos: list[str]) -> None:
+    """迁移记录号列表内重复视为非法（无法判定迁移终态）。"""
+    seen: set[str] = set()
+    for no in record_nos:
+        if no in seen:
+            raise DuplicateRecordInBatchError(f"迁移记录号列表内重复: {no}")
+        seen.add(no)
+
+
 def _apply_batch_items(
     conn: sqlite3.Connection, drill_id: str, items: list[dict]
 ) -> bool:
@@ -955,6 +995,123 @@ def seal_drill(drill_id: str) -> dict:
                 (_now_iso(), drill_id),
             )
         return get_drill(drill_id)
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# 日志跨演练迁移（复核员发现日志归错演练，一次移到目标演练）
+#
+# 一次调用把一组记录从源演练原子移至目标演练：
+#   * 前置校验（任一不过即整次拒绝、两端状态不变）：源、目标演练均存在、
+#     均未封存、源 != 目标；记录号列表非空且无重复；源记录全部存在；
+#     目标没有同号记录；被移记录均不参与源演练的人工锁定；
+#   * 迁移保留日志原字段（呼号/对方/带时区时间/波段/模式原样保留），
+#     仅按目标演练的允许时差重新参与互证；
+#   * 源、目标在同一个写事务内各只重算一次、各只推进一次版本，分别留存
+#     该版快照；未迁移的源锁定照常生效，目标既有锁定（不引用迁入记录）
+#     同样有效；历史快照不可改写。
+# --------------------------------------------------------------------------
+def migrate_logs(
+    source_drill_id: str, target_drill_id: str, record_nos: Iterable[str]
+) -> dict:
+    """把源演练的一组日志一次原子迁移到目标演练。"""
+    record_nos = list(record_nos)
+    _check_record_no_unique(record_nos)
+
+    conn = connect()
+    try:
+        with _write_tx(conn):
+            source = _get_drill_row(conn, source_drill_id)
+            if source_drill_id == target_drill_id:
+                raise MigrationSameDrillError(
+                    f"源演练与目标演练不能相同: {source_drill_id}"
+                )
+            target = _get_drill_row(conn, target_drill_id)
+            _require_unsealed(source)
+            _require_unsealed(target)
+
+            nos = sorted(set(record_nos))
+
+            # 源记录必须全部存在（缺失即整次拒绝）。
+            placeholders = ",".join("?" for _ in nos)
+            existing_rows = conn.execute(
+                f"SELECT record_no FROM logs WHERE drill_id = ? "
+                f"AND record_no IN ({placeholders})",
+                (source_drill_id, *nos),
+            ).fetchall()
+            existing = {r["record_no"] for r in existing_rows}
+            missing = sorted(set(nos) - existing)
+            if missing:
+                raise MigrationRecordMissingError(
+                    f"源演练 {source_drill_id} 中记录不存在: "
+                    + ", ".join(missing)
+                )
+
+            # 目标演练不得已有同号记录。
+            clash_rows = conn.execute(
+                f"SELECT record_no FROM logs WHERE drill_id = ? "
+                f"AND record_no IN ({placeholders})",
+                (target_drill_id, *nos),
+            ).fetchall()
+            if clash_rows:
+                clash = min(r["record_no"] for r in clash_rows)
+                raise MigrationTargetExistsError(
+                    f"目标演练 {target_drill_id} 已存在同号记录: {clash}"
+                )
+
+            # 被移记录不得参与源演练的人工锁定（未迁移的锁定照常生效）。
+            locked_rows = conn.execute(
+                f"SELECT record_a, record_b FROM locks WHERE drill_id = ? "
+                f"AND (record_a IN ({placeholders}) "
+                f"OR record_b IN ({placeholders}))",
+                (source_drill_id, *nos, *nos),
+            ).fetchall()
+            if locked_rows:
+                row = locked_rows[0]
+                raise MigrationRecordLockedError(
+                    f"记录参与源演练的人工锁定 ({row['record_a']}, "
+                    f"{row['record_b']})，不能迁移"
+                )
+
+            # 保留日志原字段迁入目标（updated_at 记为迁移时刻；其余原样）。
+            now = _now_iso()
+            for no in nos:
+                src = conn.execute(
+                    "SELECT * FROM logs WHERE drill_id = ? AND record_no = ?",
+                    (source_drill_id, no),
+                ).fetchone()
+                conn.execute(
+                    "INSERT INTO logs (drill_id, record_no, station, "
+                    "counterpart, ts_micros, ts_iso, band, mode, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        target_drill_id, src["record_no"], src["station"],
+                        src["counterpart"], src["ts_micros"], src["ts_iso"],
+                        src["band"], src["mode"], now,
+                    ),
+                )
+            # 从源演练移除被迁记录。
+            conn.execute(
+                f"DELETE FROM logs WHERE drill_id = ? "
+                f"AND record_no IN ({placeholders})",
+                (source_drill_id, *nos),
+            )
+
+            # 源、目标各只重算一次：按各自允许时差重新互证，各推进一个版本
+            # 并在本事务留存该版快照。
+            _recompute(conn, source_drill_id)
+            _recompute(conn, target_drill_id)
+
+            source_result = _result_from_conn(conn, source_drill_id)
+            target_result = _result_from_conn(conn, target_drill_id)
+        return {
+            "source_drill_id": source_drill_id,
+            "target_drill_id": target_drill_id,
+            "migrated_records": nos,
+            "source_result": source_result,
+            "target_result": target_result,
+        }
     finally:
         conn.close()
 

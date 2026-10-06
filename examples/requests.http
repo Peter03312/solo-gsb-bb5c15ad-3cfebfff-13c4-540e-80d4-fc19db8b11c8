@@ -131,6 +131,21 @@ Content-Type: application/json
 ### 查看全部日志
 GET {{host}}/drills/{{drill}}/logs
 
+### 日志跨演练迁移（复核员纠正“日志归错演练”）
+### 路径上为源演练；目标演练与非空、无重复记录号放请求体。
+### 仅当两端均存在且未封存、源记录全存在、目标无同号记录、
+### 且被移记录不参与源演练人工锁定时受理，否则整次拒绝、两端状态不变。
+### 成功：保留日志原字段，按目标允许时差重新互证；源、目标各只推进一次
+### 版本并重算、同事务各留存一版快照（原子提交）。
+@targetDrill = DRILL-2026-B
+POST {{host}}/drills/{{drill}}/logs/migrate
+Content-Type: application/json
+
+{
+  "target_drill_id": "{{targetDrill}}",
+  "record_nos": ["R7", "R8"]
+}
+
 ### 查询互证结果（配对 + 未配对 + 版本 + 总时差）
 GET {{host}}/drills/{{drill}}/result
 

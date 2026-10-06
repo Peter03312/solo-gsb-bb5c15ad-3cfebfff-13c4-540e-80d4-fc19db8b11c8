@@ -307,6 +307,53 @@ class LockListResponse(StrictModel):
 
 
 # --------------------------------------------------------------------------
+# 日志跨演练迁移（复核员发现日志归错演练，一次移到目标演练）
+# --------------------------------------------------------------------------
+class LogMigrationRequest(StrictModel):
+    """把源演练的一组日志迁移到目标演练：目标演练号 + 非空无重复记录号。"""
+
+    target_drill_id: str = Field(
+        ..., description="目标演练号（须与路径上的源演练号不同且均存在、未封存）"
+    )
+    record_nos: list[str] = Field(
+        ...,
+        min_length=1,
+        description="待迁移记录号列表（非空、无重复；源演练须全部存在）",
+    )
+
+    @field_validator("target_drill_id")
+    @classmethod
+    def _target_drill_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("目标演练号不能为空")
+        return v
+
+    @field_validator("record_nos")
+    @classmethod
+    def _record_nos(cls, v: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for no in v:
+            if not isinstance(no, str):
+                raise ValueError("记录号必须是字符串")
+            no = no.strip()
+            if not no:
+                raise ValueError("记录号不能为空")
+            cleaned.append(no)
+        return cleaned
+
+
+class LogMigrationResponse(StrictModel):
+    """迁移成功响应：两端新版本互证结果（日志/版本/结果/快照已原子提交）。"""
+
+    source_drill_id: str
+    target_drill_id: str
+    migrated_records: list[str]
+    source_result: ResultResponse
+    target_result: ResultResponse
+
+
+# --------------------------------------------------------------------------
 # 版本快照（复核员按版本回看 / 比较）
 # --------------------------------------------------------------------------
 class SnapshotResponse(StrictModel):
